@@ -1,0 +1,47 @@
+name: Download URL and Add as Release Asset
+
+# This allows you to run it manually from the GitHub website
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Full URL of the file you want to download (must be direct download link)'
+        required: true
+        type: string
+      release_tag:
+        description: 'Release tag to attach the asset to (example: v1.0 or latest)'
+        required: true
+        type: string
+      asset_name:
+        description: 'Name of the file when uploaded (optional - if empty, uses the original filename)'
+        required: false
+        type: string
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # This is required to upload assets to releases
+
+    steps:
+      - name: Download the file from the URL
+        run: |
+          # Download the file and save it
+          curl -L -o downloaded-file "${{ inputs.file_url }}"
+
+      - name: Decide the final asset name
+        id: asset
+        run: |
+          if [ -n "${{ inputs.asset_name }}" ]; then
+            echo "final_name=${{ inputs.asset_name }}" >> $GITHUB_OUTPUT
+          else
+            # Extract filename from URL if no custom name is given
+            FILENAME=$(basename "${{ inputs.file_url }}")
+            echo "final_name=$FILENAME" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload the file as Release Asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.release_tag }}" downloaded-file#"${{ steps.asset.outputs.final_name }}" --clobber
