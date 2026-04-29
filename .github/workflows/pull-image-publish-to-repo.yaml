@@ -1,0 +1,145 @@
+name: Pull image and save into repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: "Container image reference, e.g. ghcr.io/org/app or ghcr.io/org/app:tag"
+        required: true
+        type: string
+      runtime:
+        description: "Tool to use for pulling/saving the image"
+        required: true
+        type: choice
+        default: docker
+        options:
+          - docker
+          - podman
+
+jobs:
+  pull-and-save:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      IMAGE_REF_INPUT: ${{ github.event.inputs.image_ref }}
+      RUNTIME: ${{ github.event.inputs.runtime }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Podman (if needed)
+        if: ${{ env.RUNTIME == 'podman' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman gzip
+
+      - name: Normalize image reference
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_REF="$IMAGE_REF_INPUT"
+
+          if [[ "$IMAGE_REF" != *@* ]] && [[ ! "$IMAGE_REF" =~ :[^/]+$ ]]; then
+            IMAGE_REF="${IMAGE_REF}:latest"
+          fi
+
+          echo "IMAGE_REF=$IMAGE_REF" >> "$GITHUB_ENV"
+
+          SAFE_FOLDER="$(python3 - <<'PY'
+import os, re
+image_ref = os.environ["IMAGE_REF"]
+safe = re.sub(r"[^A-Za-z0-9._-]+", "-", image_ref)
+safe = re.sub(r"-+", "-", safe).strip("-_.")
+print(safe or "image")
+PY
+)"
+          echo "SAFE_FOLDER=$SAFE_FOLDER" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        if: ${{ startsWith(env.IMAGE_REF_INPUT, 'ghcr.io/') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNTIME" = "podman" ]; then
+            echo "${{ github.token }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          fi
+
+      - name: Pull image, save, chunk if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "images/$SAFE_FOLDER"
+
+          temp_tar="image.tar"
+          temp_gz="image.tar.gz"
+          chunk_size=$((90 * 1024 * 1024))
+
+          echo "Using image: $IMAGE_REF"
+          echo "Saving under: images/$SAFE_FOLDER"
+
+          if [ "$RUNTIME" = "podman" ]; then
+            podman pull "$IMAGE_REF"
+            podman save -o "$temp_tar" "$IMAGE_REF"
+          else
+            docker pull "$IMAGE_REF"
+            docker save -o "$temp_tar" "$IMAGE_REF"
+          fi
+
+          gzip -9 "$temp_tar"
+
+          file_size=$(stat -c%s "$temp_gz")
+
+          if [ "$file_size" -le "$chunk_size" ]; then
+            mv "$temp_gz" "images/$SAFE_FOLDER/${SAFE_FOLDER}.tar.gz"
+            echo "Saved: images/$SAFE_FOLDER/${SAFE_FOLDER}.tar.gz"
+          else
+            python3 - <<'PY'
+import os
+import zipfile
+from pathlib import Path
+
+chunk_size = 90 * 1024 * 1024
+folder = Path("images") / os.environ["SAFE_FOLDER"]
+src = Path("image.tar.gz")
+
+data = src.read_bytes()
+src.unlink()
+
+part = 1
+for offset in range(0, len(data), chunk_size):
+    chunk = data[offset:offset + chunk_size]
+    zip_path = folder / f"{folder.name}.tar.gz_part{part:03d}.zip"
+    inner_name = f"{folder.name}.tar.gz.part{part:03d}"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(inner_name, chunk)
+    print(f"Created: {zip_path}")
+    part += 1
+PY
+          fi
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A images
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add pulled image to images folder"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
