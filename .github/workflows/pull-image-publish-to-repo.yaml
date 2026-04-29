@@ -32,13 +32,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Podman (if needed)
-        if: ${{ env.RUNTIME == 'podman' }}
+      - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y podman gzip
+          sudo apt-get install -y zip
+          if [ "$RUNTIME" = "podman" ]; then
+            sudo apt-get install -y podman
+          fi
 
-      - name: Normalize image reference
+      - name: Normalize image reference and folder name
         shell: bash
         run: |
           set -euo pipefail
@@ -49,16 +52,14 @@ jobs:
             IMAGE_REF="${IMAGE_REF}:latest"
           fi
 
-          echo "IMAGE_REF=$IMAGE_REF" >> "$GITHUB_ENV"
+          SAFE_FOLDER="$(printf '%s' "$IMAGE_REF" \
+            | sed 's/[^A-Za-z0-9._-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//')"
 
-          SAFE_FOLDER="$(python3 - <<'PY'
-import os, re
-image_ref = os.environ["IMAGE_REF"]
-safe = re.sub(r"[^A-Za-z0-9._-]+", "-", image_ref)
-safe = re.sub(r"-+", "-", safe).strip("-_.")
-print(safe or "image")
-PY
-)"
+          if [ -z "$SAFE_FOLDER" ]; then
+            SAFE_FOLDER="image"
+          fi
+
+          echo "IMAGE_REF=$IMAGE_REF" >> "$GITHUB_ENV"
           echo "SAFE_FOLDER=$SAFE_FOLDER" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
@@ -72,15 +73,16 @@ PY
             echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           fi
 
-      - name: Pull image, save, chunk if needed
+      - name: Pull image, save, and chunk if needed
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
 
           mkdir -p "images/$SAFE_FOLDER"
 
-          temp_tar="image.tar"
-          temp_gz="image.tar.gz"
+          tmp_tar="image.tar"
+          tmp_gz="image.tar.gz"
           chunk_size=$((90 * 1024 * 1024))
 
           echo "Using image: $IMAGE_REF"
@@ -88,42 +90,39 @@ PY
 
           if [ "$RUNTIME" = "podman" ]; then
             podman pull "$IMAGE_REF"
-            podman save -o "$temp_tar" "$IMAGE_REF"
+            podman save -o "$tmp_tar" "$IMAGE_REF"
           else
             docker pull "$IMAGE_REF"
-            docker save -o "$temp_tar" "$IMAGE_REF"
+            docker save -o "$tmp_tar" "$IMAGE_REF"
           fi
 
-          gzip -9 "$temp_tar"
+          gzip -9 "$tmp_tar"
 
-          file_size=$(stat -c%s "$temp_gz")
+          size="$(stat -c%s "$tmp_gz")"
+          base_name="${SAFE_FOLDER}.tar.gz"
+          dest_dir="images/$SAFE_FOLDER"
 
-          if [ "$file_size" -le "$chunk_size" ]; then
-            mv "$temp_gz" "images/$SAFE_FOLDER/${SAFE_FOLDER}.tar.gz"
-            echo "Saved: images/$SAFE_FOLDER/${SAFE_FOLDER}.tar.gz"
+          if [ "$size" -le "$chunk_size" ]; then
+            mv "$tmp_gz" "$dest_dir/$base_name"
+            echo "Saved: $dest_dir/$base_name"
           else
-            python3 - <<'PY'
-import os
-import zipfile
-from pathlib import Path
+            split_prefix="$dest_dir/$base_name.part"
+            split -b 90m -d -a 3 "$tmp_gz" "$split_prefix"
+            rm -f "$tmp_gz"
 
-chunk_size = 90 * 1024 * 1024
-folder = Path("images") / os.environ["SAFE_FOLDER"]
-src = Path("image.tar.gz")
+            part_num=1
+            for part in "$split_prefix"*; do
+              [ -f "$part" ] || continue
 
-data = src.read_bytes()
-src.unlink()
+              zip_name="${base_name}_part$(printf '%03d' "$part_num").zip"
+              zip_path="$dest_dir/$zip_name"
 
-part = 1
-for offset in range(0, len(data), chunk_size):
-    chunk = data[offset:offset + chunk_size]
-    zip_path = folder / f"{folder.name}.tar.gz_part{part:03d}.zip"
-    inner_name = f"{folder.name}.tar.gz.part{part:03d}"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
-        zf.writestr(inner_name, chunk)
-    print(f"Created: {zip_path}")
-    part += 1
-PY
+              zip -j -q "$zip_path" "$part"
+              rm -f "$part"
+
+              echo "Created: $zip_path"
+              part_num=$((part_num + 1))
+            done
           fi
 
       - name: Commit and push changes
