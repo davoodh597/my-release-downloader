@@ -1,0 +1,105 @@
+name: Download File into Repo Downloads Folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Full direct download URL of the file (http/https)"
+        required: true
+        type: string
+      asset_name:
+        description: "Optional output filename (leave empty to use filename from URL)"
+        required: false
+        type: string
+
+jobs:
+  download-and-save:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download file, create folder, and chunk if needed
+        env:
+          FILE_URL: ${{ inputs.file_url }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse, unquote
+
+          CHUNK_SIZE = 90 * 1024 * 1024  # 90 MiB
+
+          file_url = os.environ["FILE_URL"]
+          asset_name = os.getenv("ASSET_NAME", "").strip()
+
+          if not asset_name:
+              asset_name = Path(unquote(urlparse(file_url).path)).name or "downloaded-file"
+
+          asset_name = Path(asset_name).name
+          stem = Path(asset_name).stem
+
+          safe_folder = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-_.") or "downloaded-file"
+
+          downloads_dir = Path("downloads")
+          target_dir = downloads_dir / safe_folder
+          target_dir.mkdir(parents=True, exist_ok=True)
+
+          temp_path = Path("downloaded-file.tmp")
+
+          print(f"Downloading: {file_url}")
+          subprocess.run(
+              ["curl", "-L", "--fail", "--retry", "3", "--connect-timeout", "30", "-o", str(temp_path), file_url],
+              check=True
+          )
+
+          size = temp_path.stat().st_size
+          print(f"Downloaded size: {size} bytes")
+
+          if size <= CHUNK_SIZE:
+              dest = target_dir / asset_name
+              shutil.move(str(temp_path), dest)
+              print(f"Saved file to: {dest}")
+          else:
+              part_num = 1
+              with temp_path.open("rb") as f:
+                  while True:
+                      chunk = f.read(CHUNK_SIZE)
+                      if not chunk:
+                          break
+
+                      zip_name = f"{stem}_part{part_num:03d}.zip"
+                      zip_path = target_dir / zip_name
+                      inner_name = f"{asset_name}.part{part_num:03d}"
+
+                      with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                          zf.writestr(inner_name, chunk)
+
+                      print(f"Created chunk: {zip_path}")
+                      part_num += 1
+
+              temp_path.unlink(missing_ok=True)
+          PY
+
+      - name: Commit and push changes
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads
+          git commit -m "Add downloaded file to downloads folder"
+          git push
