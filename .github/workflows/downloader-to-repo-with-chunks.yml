@@ -24,11 +24,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download file, create folder, and chunk if needed
+      - name: Download file and save into repo
         env:
           FILE_URL: ${{ inputs.file_url }}
           ASSET_NAME: ${{ inputs.asset_name }}
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
           import os
           import re
@@ -47,20 +49,44 @@ jobs:
               asset_name = Path(unquote(urlparse(file_url).path)).name or "downloaded-file"
 
           asset_name = Path(asset_name).name
-          stem = Path(asset_name).stem
 
-          safe_folder = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-_.") or "downloaded-file"
+          def strip_all_suffixes(name: str) -> str:
+              p = Path(name)
+              base = p.name
+              while True:
+                  stem = Path(base).stem
+                  if stem == base:
+                      break
+                  base = stem
+              return base or "downloaded-file"
+
+          folder_name = re.sub(r"[^A-Za-z0-9._-]+", "-", strip_all_suffixes(asset_name)).strip("-_.")
+          if not folder_name:
+              folder_name = "downloaded-file"
 
           downloads_dir = Path("downloads")
-          target_dir = downloads_dir / safe_folder
+          target_dir = downloads_dir / folder_name
           target_dir.mkdir(parents=True, exist_ok=True)
 
           temp_path = Path("downloaded-file.tmp")
 
-          print(f"Downloading: {file_url}")
+          print(f"Downloading from: {file_url}")
           subprocess.run(
-              ["curl", "-L", "--fail", "--retry", "3", "--connect-timeout", "30", "-o", str(temp_path), file_url],
-              check=True
+              [
+                  "curl",
+                  "-L",
+                  "--fail",
+                  "--retry",
+                  "3",
+                  "--retry-delay",
+                  "2",
+                  "--connect-timeout",
+                  "30",
+                  "-o",
+                  str(temp_path),
+                  file_url,
+              ],
+              check=True,
           )
 
           size = temp_path.stat().st_size
@@ -78,7 +104,7 @@ jobs:
                       if not chunk:
                           break
 
-                      zip_name = f"{stem}_part{part_num:03d}.zip"
+                      zip_name = f"{Path(asset_name).stem}_part{part_num:03d}.zip"
                       zip_path = target_dir / zip_name
                       inner_name = f"{asset_name}.part{part_num:03d}"
 
@@ -92,14 +118,20 @@ jobs:
           PY
 
       - name: Commit and push changes
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          if git diff --quiet; then
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A downloads
+
+          if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads
           git commit -m "Add downloaded file to downloads folder"
-          git push
+          git push origin "HEAD:${BRANCH_NAME}"
