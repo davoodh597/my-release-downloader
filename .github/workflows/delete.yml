@@ -1,0 +1,81 @@
+name: Delete a folder from images or downloads
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_root:
+        description: "Choose which top-level folder to clean"
+        required: true
+        type: choice
+        options:
+          - images
+          - downloads
+      folder_name:
+        description: "Folder name inside the selected top-level folder, or Everything! to delete all contents inside it"
+        required: true
+        type: string
+
+jobs:
+  delete-folder:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      TARGET_ROOT: ${{ github.event.inputs.target_root }}
+      FOLDER_NAME: ${{ github.event.inputs.folder_name }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete requested folder or all contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT_DIR="$TARGET_ROOT"
+          NAME="$FOLDER_NAME"
+
+          if [ ! -d "$ROOT_DIR" ]; then
+            echo "Directory does not exist: $ROOT_DIR"
+            exit 1
+          fi
+
+          if [ "$NAME" = "Everything!" ]; then
+            echo "Deleting everything inside: $ROOT_DIR"
+            find "$ROOT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          else
+            TARGET_PATH="$ROOT_DIR/$NAME"
+
+            if [ ! -e "$TARGET_PATH" ]; then
+              echo "Target folder does not exist: $TARGET_PATH"
+              exit 1
+            fi
+
+            echo "Deleting: $TARGET_PATH"
+            rm -rf "$TARGET_PATH"
+          fi
+
+          echo "Remaining contents of $ROOT_DIR:"
+          find "$ROOT_DIR" -mindepth 1 -maxdepth 2 | sort || true
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A images downloads
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Delete folder from ${TARGET_ROOT}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
