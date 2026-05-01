@@ -1,4 +1,4 @@
-name: Delete a folder from images or downloads
+name: Delete folder from images or downloads
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
           - images
           - downloads
       folder_name:
-        description: "Folder name inside the selected top-level folder, or Everything! to delete all contents inside it"
+        description: 'Folder name inside the selected top-level folder, or "Everything!" to delete all contents inside it'
         required: true
         type: string
 
@@ -46,7 +46,7 @@ jobs:
 
           if [ "$NAME" = "Everything!" ]; then
             echo "Deleting everything inside: $ROOT_DIR"
-            find "$ROOT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+            find "$ROOT_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
           else
             TARGET_PATH="$ROOT_DIR/$NAME"
 
@@ -56,7 +56,7 @@ jobs:
             fi
 
             echo "Deleting: $TARGET_PATH"
-            rm -rf "$TARGET_PATH"
+            rm -rf -- "$TARGET_PATH"
           fi
 
           echo "Remaining contents of $ROOT_DIR:"
@@ -70,12 +70,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add -A images downloads
+          git add -A "$TARGET_ROOT"
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Delete folder from ${TARGET_ROOT}"
+          git commit -m "Delete from $TARGET_ROOT"
           git push origin "HEAD:${GITHUB_REF_NAME}"
