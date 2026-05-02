@@ -1,93 +1,85 @@
-name: Download File from URL and Add as Release Asset
+name: Fast Download + Chunked Release Upload
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Full direct download URL of the file (http/https)'
+        description: "Direct download URL"
         required: true
         type: string
       release_tag:
-        description: 'Release tag (example: v0.1)'
+        description: "Release tag (example: v0.1)"
         required: true
         type: string
       asset_name:
-        description: 'Custom name for the uploaded file (optional - leave empty to keep original name)'
+        description: "Optional custom filename"
         required: false
+        default: ""
         type: string
 
 jobs:
-  download-and-upload:
+  upload:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download and prepare asset(s)
-        shell: bash
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 parallel
+
+      - name: Download (multi-connection)
         env:
           FILE_URL: ${{ inputs.file_url }}
           ASSET_NAME: ${{ inputs.asset_name }}
         run: |
-          set -euo pipefail
+          mkdir -p work
 
-          mkdir -p release-assets
-
-          raw_name="${ASSET_NAME:-}"
-          if [ -z "$raw_name" ]; then
-            raw_name="$(basename "$(printf '%s' "$FILE_URL" | cut -d'?' -f1)")"
+          name="${ASSET_NAME:-}"
+          if [ -z "$name" ]; then
+            name=$(basename "$(echo "$FILE_URL" | cut -d'?' -f1)")
           fi
 
-          raw_name="$(basename -- "$raw_name")"
+          echo "Downloading with aria2..."
+          aria2c -x 16 -s 16 -k 1M -o "$name" -d work "$FILE_URL"
 
-          if [ -z "$raw_name" ] || [ "$raw_name" = "." ] || [ "$raw_name" = "/" ]; then
-            raw_name="downloaded-file"
-          fi
+          ls -lh work
 
-          target="release-assets/$raw_name"
+      - name: Split if needed (NO compression)
+        run: |
+          cd work
 
-          echo "Downloading from: $FILE_URL"
-          curl -L --fail --retry 3 --retry-delay 2 -o "$target" "$FILE_URL"
-          ls -lh "$target"
+          file=$(ls)
+          size=$(stat -c%s "$file")
 
-          size_bytes="$(stat -c%s "$target")"
-          echo "Downloaded size: $size_bytes bytes"
+          echo "File size: $size"
 
-          # GitHub release assets must be under 2 GiB each.
-          # For larger inputs, compress and split into ~1.9 GiB parts.
-          if [ "$size_bytes" -ge $((2 * 1024 * 1024 * 1024)) ]; then
-            echo "File is >= 2 GiB, compressing and splitting..."
+          # 1.9GB chunks
+          chunk=$((1900 * 1024 * 1024))
 
-            gzip -1 -c "$target" > "${target}.gz"
-
-            chunk_size_bytes=$((1900 * 1024 * 1024))
-            split -b "$chunk_size_bytes" -d -a 3 --additional-suffix=.gz "${target}.gz" "${target}.part-"
-
-            rm -f "$target" "${target}.gz"
-
-            echo "Created split assets:"
-            ls -lh release-assets
+          if [ "$size" -ge $((2 * 1024 * 1024 * 1024)) ]; then
+            echo "Splitting..."
+            split -b $chunk -d -a 3 "$file" "$file.part-"
+            rm "$file"
           else
-            echo "File is under 2 GiB, uploading as a single asset."
+            echo "No split needed"
           fi
 
-      - name: Upload asset(s) to release
-        shell: bash
+          ls -lh
+
+      - name: Upload (parallel)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          TAG: ${{ inputs.release_tag }}
         run: |
-          set -euo pipefail
-          shopt -s nullglob
+          cd work
 
-          files=(release-assets/*)
+          files=(*)
 
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "No files to upload."
-            exit 1
-          fi
+          printf "%s\n" "${files[@]}" > filelist.txt
 
-          echo "Uploading the following file(s):"
-          printf ' - %s\n' "${files[@]}"
+          echo "Uploading in parallel..."
 
-          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          cat filelist.txt | parallel -j 4 \
+            'gh release upload "$TAG" "{}" --repo "$GITHUB_REPOSITORY" --clobber'
