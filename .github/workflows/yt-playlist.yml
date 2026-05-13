@@ -45,7 +45,8 @@ permissions:
 jobs:
   youtube-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # افزایش زمان به‌خاطر چندین ویدیو
+    timeout-minutes: 180   # افزایش زمان برای دانلود چندین ویدیو
+
     steps:
       - name: 📂 Checkout Repository
         uses: actions/checkout@v4
@@ -75,62 +76,85 @@ jobs:
               qual = qual if qual in ('720p','1080p') else '720p'
 
           all_files = []
+          session = requests.Session()
+          session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
           for idx, URL in enumerate(urls, 1):
-              print(f"::notice::Processing video {idx}/{len(urls)}: {URL}")
+              print(f"::notice::Processing {idx}/{len(urls)} → {URL}")
               
-              payload = {
-                  "url": URL,
-                  "os": "linux",
-                  "output": {"type": "audio" if is_audio else "video", "format": fmt}
-              }
-              if is_audio:
-                  payload["audio"] = {"bitrate": qual}
-              else:
-                  payload["output"]["quality"] = qual
+              try:
+                  payload = {
+                      "url": URL,
+                      "os": "linux",
+                      "output": {"type": "audio" if is_audio else "video", "format": fmt}
+                  }
+                  if is_audio:
+                      payload["audio"] = {"bitrate": qual}
+                  else:
+                      payload["output"]["quality"] = qual
 
-              s = requests.Session()
-              s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-              s.get("https://media.ytmp3.gg/")
-              resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-              resp.raise_for_status()
-              data = resp.json()
-              status_url = data.get('statusUrl')
-              title = data.get('title', f'video_{idx}')
+                  session.get("https://media.ytmp3.gg/", timeout=15)
+                  resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+                  resp.raise_for_status()
+                  data = resp.json()
+                  status_url = data.get('statusUrl')
+                  title = data.get('title', f'video_{idx}')
 
-              dl_url = None
-              for _ in range(180):
-                  time.sleep(2)
-                  r = s.get(status_url, timeout=20)
-                  status = r.json()
-                  if status.get('status') == 'completed':
-                      dl_url = status.get('downloadUrl')
-                      break
-                  if status.get('status') == 'failed':
-                      print(f"::warning::Failed to prepare video {idx}")
-                      break
+                  if not status_url:
+                      print(f"::warning::No status URL for video {idx}")
+                      continue
 
-              if not dl_url:
-                  print(f"::warning::Could not get download link for video {idx}")
+                  # Smarter polling
+                  dl_url = None
+                  max_wait = 300  # 5 minutes max per video
+                  start_time = time.time()
+
+                  for attempt in range(90):
+                      time.sleep(3)
+                      if time.time() - start_time > max_wait:
+                          print(f"::warning::Timeout waiting for video {idx}")
+                          break
+                          
+                      r = session.get(status_url, timeout=20)
+                      status = r.json()
+                      
+                      if status.get('status') == 'completed':
+                          dl_url = status.get('downloadUrl')
+                          break
+                      if status.get('status') == 'failed':
+                          print(f"::warning::Server failed for video {idx}")
+                          break
+
+                  if not dl_url:
+                      print(f"::warning::Could not get download link for video {idx}")
+                      continue
+
+                  # Generate clean filename
+                  vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)
+                  vid = vid_match.group(1) if vid_match else f"vid{idx}"
+                  
+                  clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+                  clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+                  clean = clean.lstrip('-')
+                  fname = f"{clean}_{vid}_{qual}.{fmt}"
+
+                  all_files.append((dl_url, fname, title, URL))
+                  print(f"::notice::✓ Ready: {fname}")
+
+              except Exception as e:
+                  print(f"::warning::Error processing video {idx}: {str(e)}")
                   continue
 
-              # Generate clean filename
-              vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)
-              vid = vid.group(1) if vid else f"vid{idx}"
-              clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-              clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
-              clean = clean.lstrip('-')
-              fname = f"{clean}_{vid}_{qual}.{fmt}"
+              time.sleep(2)  # Delay between videos
 
-              all_files.append((dl_url, fname, title, URL))
-
-          # Save info for later steps
+          # Save download info
           with open(".download_info", "w", encoding="utf-8") as f:
               for dl_url, fname, title, url in all_files:
                   f.write(f"{dl_url}|{fname}|{title}|{url}\n")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"count={len(all_files)}\n")
+              f.write(f"processed={len(urls)}\n")
           EOF
         env:
           INPUT_URLS: ${{ github.event.inputs.video_urls }}
@@ -143,10 +167,7 @@ jobs:
           while IFS='|' read -r dl_url fname title url || [ -n "$dl_url" ]; do
             if [ -z "$dl_url" ]; then continue; fi
             echo "Downloading: $fname"
-            curl -L --fail --progress-bar -o "release_files/$fname" "$dl_url"
-            if [ ! -s "release_files/$fname" ]; then
-              echo "::warning::Downloaded file is empty: $fname"
-            fi
+            curl -L --fail --progress-bar -o "release_files/$fname" "$dl_url" || echo "::warning::Failed to download $fname"
           done < .download_info
 
       - name: ✂️ Split Large Files (if needed)
@@ -157,12 +178,12 @@ jobs:
           fi
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
 
-          cd release_files
+          cd release_files || exit 0
           for file in *; do
             if [ ! -f "$file" ]; then continue; fi
-            FILESIZE=$(stat -c%s "$file")
+            FILESIZE=$(stat -c%s "$file" 2>/dev/null || echo 0)
             if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
-              echo "Splitting large file: $file"
+              echo "Splitting: $file (${FILESIZE} bytes)"
               BASE="${file%.*}"
               zip -r -s "${THRESH_MB}m" "${BASE}.zip" "$file"
               rm -- "$file"
