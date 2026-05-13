@@ -1,12 +1,13 @@
-name: دانلودر پلی‌لیست یوتیوب
+name: دانلودر یوتیوب
 
 on:
   workflow_dispatch:
     inputs:
-      video_urls:
-        description: 'YouTube لینک‌ها (چند لینک با " | " جدا کنید)'
+      video_url:
+        description: 'YouTube video URLs separated by " | "'
         required: true
         type: string
+
       output_format:
         description: 'نوع خروجی'
         required: true
@@ -15,16 +16,19 @@ on:
           - mp4 (video)
           - mp3 (audio only)
         default: 'mp4 (video)'
+
       desired_quality:
         description: 'کیفیت (ویدیو: 720p, 1080p | صدا: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
+
       max_part_mb:
         description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
         required: false
         type: string
         default: '90'
+
       upload_method:
         description: '📤 روش ذخیره نهایی'
         required: true
@@ -33,6 +37,7 @@ on:
           - repository (push to repo)
           - release (GitHub Releases)
         default: 'repository (push to repo)'
+
       release_tag:
         description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
         required: false
@@ -45,7 +50,7 @@ permissions:
 jobs:
   youtube-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # افزایش زمان برای دانلود چندین ویدیو
+    timeout-minutes: 45
 
     steps:
       - name: 📂 Checkout Repository
@@ -59,116 +64,129 @@ jobs:
           sudo apt-get install -y zip curl python3 python3-pip
           pip3 install --quiet requests
 
-      - name: 🔗 Process All YouTube Links
+      - name: 🔗 Get Download Links
         id: retrieve
         run: |
           python3 << 'EOF'
-          import os, sys, time, re, requests
+          import os, sys, time, re, json, requests
 
-          urls = [u.strip() for u in os.environ.get('INPUT_URLS', '').split(' | ') if u.strip()]
-          fmt = os.environ.get('INPUT_FORMAT')
-          qual = os.environ.get('INPUT_QUALITY')
+          raw_urls = os.environ.get('INPUT_URLS', '').strip()
+          fmt = os.environ.get('INPUT_FORMAT', 'mp4')
+          qual = os.environ.get('INPUT_QUALITY', '720p')
+
+          urls = [u.strip() for u in raw_urls.split('|') if u.strip()]
+          if not urls:
+              print("::error::No video URLs provided")
+              sys.exit(1)
+
           is_audio = fmt == 'mp3'
-
           if is_audio:
-              qual = qual if qual in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
+              qual = qual if qual in ('64kbps', '128kbps', '192kbps', '320kbps') else '192kbps'
           else:
-              qual = qual if qual in ('720p','1080p') else '720p'
+              qual = qual if qual in ('720p', '1080p') else '720p'
 
-          all_files = []
-          session = requests.Session()
-          session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s.get("https://media.ytmp3.gg/")
 
-          for idx, URL in enumerate(urls, 1):
-              print(f"::notice::Processing {idx}/{len(urls)} → {URL}")
-              
-              try:
-                  payload = {
-                      "url": URL,
-                      "os": "linux",
-                      "output": {"type": "audio" if is_audio else "video", "format": fmt}
-                  }
-                  if is_audio:
-                      payload["audio"] = {"bitrate": qual}
-                  else:
-                      payload["output"]["quality"] = qual
+          manifest = []
+          for idx, url in enumerate(urls, start=1):
+              payload = {
+                  "url": url,
+                  "os": "linux",
+                  "output": {"type": "audio" if is_audio else "video", "format": fmt}
+              }
+              if is_audio:
+                  payload["audio"] = {"bitrate": qual}
+              else:
+                  payload["output"]["quality"] = qual
 
-                  session.get("https://media.ytmp3.gg/", timeout=15)
-                  resp = session.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-                  resp.raise_for_status()
-                  data = resp.json()
-                  status_url = data.get('statusUrl')
-                  title = data.get('title', f'video_{idx}')
+              resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+              resp.raise_for_status()
+              data = resp.json()
 
-                  if not status_url:
-                      print(f"::warning::No status URL for video {idx}")
-                      continue
+              status_url = data.get('statusUrl')
+              title = data.get('title', 'video')
 
-                  # Smarter polling
-                  dl_url = None
-                  max_wait = 300  # 5 minutes max per video
-                  start_time = time.time()
+              dl_url = None
+              for _ in range(150):
+                  time.sleep(2)
+                  r = s.get(status_url, timeout=20)
+                  r.raise_for_status()
+                  status = r.json()
 
-                  for attempt in range(90):
-                      time.sleep(3)
-                      if time.time() - start_time > max_wait:
-                          print(f"::warning::Timeout waiting for video {idx}")
-                          break
-                          
-                      r = session.get(status_url, timeout=20)
-                      status = r.json()
-                      
-                      if status.get('status') == 'completed':
-                          dl_url = status.get('downloadUrl')
-                          break
-                      if status.get('status') == 'failed':
-                          print(f"::warning::Server failed for video {idx}")
-                          break
+                  if status.get('status') == 'completed':
+                      dl_url = status.get('downloadUrl')
+                      break
+                  if status.get('status') == 'failed':
+                      print(f"::error::Server failed to prepare the video: {url}")
+                      sys.exit(1)
 
-                  if not dl_url:
-                      print(f"::warning::Could not get download link for video {idx}")
-                      continue
+              if not dl_url:
+                  print(f"::error::Could not get download link for: {url}")
+                  sys.exit(1)
 
-                  # Generate clean filename
-                  vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)
-                  vid = vid_match.group(1) if vid_match else f"vid{idx}"
-                  
-                  clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-                  clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
-                  clean = clean.lstrip('-')
-                  fname = f"{clean}_{vid}_{qual}.{fmt}"
+              m = re.search(r'(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})', url)
+              vid = m.group(1) if m else f"item{idx:02d}"
 
-                  all_files.append((dl_url, fname, title, URL))
-                  print(f"::notice::✓ Ready: {fname}")
+              clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+              clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+              clean = clean.lstrip('-')
 
-              except Exception as e:
-                  print(f"::warning::Error processing video {idx}: {str(e)}")
-                  continue
+              fname = f"{idx:02d}_{clean}_{vid}_{qual}.{fmt}"
 
-              time.sleep(2)  # Delay between videos
+              manifest.append({
+                  "index": idx,
+                  "source_url": url,
+                  "download_url": dl_url,
+                  "filename": fname,
+                  "title": title
+              })
 
-          # Save download info
-          with open(".download_info", "w", encoding="utf-8") as f:
-              for dl_url, fname, title, url in all_files:
-                  f.write(f"{dl_url}|{fname}|{title}|{url}\n")
+          with open(".download_manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"count={len(all_files)}\n")
-              f.write(f"processed={len(urls)}\n")
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f"count={len(manifest)}\n")
+              f.write(f"format={fmt}\n")
+              f.write(f"quality={qual}\n")
           EOF
         env:
-          INPUT_URLS: ${{ github.event.inputs.video_urls }}
+          INPUT_URLS: ${{ github.event.inputs.video_url }}
           INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
 
       - name: 📥 Download All Files
         run: |
-          mkdir -p release_files
-          while IFS='|' read -r dl_url fname title url || [ -n "$dl_url" ]; do
-            if [ -z "$dl_url" ]; then continue; fi
-            echo "Downloading: $fname"
-            curl -L --fail --progress-bar -o "release_files/$fname" "$dl_url" || echo "::warning::Failed to download $fname"
-          done < .download_info
+          python3 << 'EOF'
+          import json, pathlib, sys, requests
+
+          with open(".download_manifest.json", "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+
+          out_dir = pathlib.Path("release_files")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0"})
+
+          for item in manifest:
+              filename = item["filename"]
+              url = item["download_url"]
+              path = out_dir / filename
+
+              print(f"Downloading: {filename}")
+              with s.get(url, stream=True, timeout=120) as r:
+                  r.raise_for_status()
+                  with open(path, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
+
+              if not path.exists() or path.stat().st_size == 0:
+                  print(f"::error::Downloaded file is empty: {filename}")
+                  sys.exit(1)
+          EOF
 
       - name: ✂️ Split Large Files (if needed)
         run: |
@@ -176,20 +194,28 @@ jobs:
           if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
             THRESH_MB=1800
           fi
+
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
 
-          cd release_files || exit 0
-          for file in *; do
-            if [ ! -f "$file" ]; then continue; fi
-            FILESIZE=$(stat -c%s "$file" 2>/dev/null || echo 0)
+          shopt -s nullglob
+          for filepath in release_files/*; do
+            [ -f "$filepath" ] || continue
+
+            FILESIZE=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
             if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
-              echo "Splitting: $file (${FILESIZE} bytes)"
-              BASE="${file%.*}"
-              zip -r -s "${THRESH_MB}m" "${BASE}.zip" "$file"
-              rm -- "$file"
+              echo "🔪 Splitting $(basename "$filepath") into ${THRESH_MB}MB parts..."
+              cd release_files
+              base="$(basename "$filepath")"
+              zip -r -s "${THRESH_MB}m" "${base%.*}.zip" "./$base"
+              rm -- "$base"
+              cd ..
+            else
+              echo "📦 No split needed for $(basename "$filepath") ($(( FILESIZE / 1024 / 1024 )) MB)"
             fi
           done
-          cd ..
+
+          echo "Final files:"
+          ls -lh release_files/
 
       - name: 📅 Get Current Date
         id: get_date
@@ -200,25 +226,27 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           mkdir -p downloads
           mv release_files/* downloads/ 2>/dev/null || true
+
           git add downloads/
-          git commit -m "⬇️ YouTube Batch Download [${{ steps.retrieve.outputs.count }} files] [skip ci]" || echo "Nothing to commit"
+          git commit -m "⬇️ YouTube batch download [skip ci]" || echo "Nothing to commit"
           git push
 
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-batch-{0}', github.run_number) }}
-          name: YouTube Batch Download - ${{ steps.retrieve.outputs.count }} files
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
+          name: ${{ format('YouTube batch - {0}', github.run_number) }}
           body: |
             **📽️ YouTube Batch Download**
-            **Total Files:** ${{ steps.retrieve.outputs.count }}
-            **Quality:** ${{ github.event.inputs.desired_quality }}
-            **Format:** ${{ github.event.inputs.output_format }}
+            **Count:** ${{ steps.retrieve.outputs.count }}
+            **Format:** ${{ steps.retrieve.outputs.format }}
+            **Quality:** ${{ steps.retrieve.outputs.quality }}
             **Downloaded on:** ${{ steps.get_date.outputs.date }}
-            
+            ---
             Powered by Meli-Action ⚡
           files: release_files/*
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -227,4 +255,4 @@ jobs:
 
       - name: 🧹 Cleanup
         if: always()
-        run: rm -rf release_files .download_info 2>/dev/null || true
+        run: rm -rf release_files .download_manifest.json 2>/dev/null || true
